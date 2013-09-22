@@ -1,0 +1,291 @@
+#!/bin/sh
+
+# ########################################################################
+# This program is part of mozsql
+# License: GPL License (see COPYING) & Mozilla Public License
+# Authors:
+#  Brandon Johnson
+# ########################################################################
+
+# ########################################################################
+# Redirect STDERR to STDOUT; Nagios doesn't handle STDERR.
+# ########################################################################
+exec 2>&1
+
+# ########################################################################
+# Run the program.
+# ########################################################################
+main() {
+   # Get options
+   for o; do
+      case "${o}" in
+         -c)              shift; OPT_CRIT="${1}"; shift; ;;
+         --defaults-file) shift; OPT_DEFT="${1}"; shift; ;;
+         -H)              shift; OPT_HOST="${1}"; shift; ;;
+         -u)              shift; OPT_USER="${1}"; shift; ;;
+         -p)              shift; OPT_PASS="${1}"; shift; ;;
+         -P)              shift; OPT_PORT="${1}"; shift; ;;
+         -S)              shift; OPT_SOCK="${1}"; shift; ;;
+         -w)              shift; OPT_WARN="${1}"; shift; ;;
+         -n)              shift; OPT_NAGIOS="y"; ;;
+         --version)       grep -A2 '^=head1 VERSION' "$0" | tail -n1; exit 0 ;;
+         --help)          perl -00 -ne 'm/^  Usage:/ && print' "$0"; exit 0 ;;
+         -*)              echo "Unknown option ${o}.  Try --help."; exit 1; ;;
+      esac
+   done
+
+   OPT_NAGIOS=${OPT_NAGIOS:="n"}
+
+   if [[ ${OPT_NAGIOS} = "y" ]]; then
+          OPT_CRIT=${OPT_CRIT:-1000}
+          OPT_WARN=${OPT_WARN:-1000}
+   fi
+
+   if is_not_sourced && [[ ${OPT_NAGIOS} = "y" ]]; then
+      if [ -n "$1" ]; then
+         echo "WARN spurious command-line options: $@"
+         exit 1
+      fi
+   fi
+
+   # Get processlist into a temp file.
+   local TEMP=$(mktemp -t "${0##*/}.XXXXXX") || exit $?
+   trap "rm -f '${TEMP}' >/dev/null 2>&1" EXIT
+   mysql_exec 'SHOW SLAVE STATUS\G' > "${TEMP}"
+   if [ $? = 0 ]; then
+      # Capture the important variables and parse them
+          IO_THREAD=$(awk '/Slave_IO_Running:/{print $2}' "${TEMP}")
+          SQL_THREAD=$(awk '/Slave_SQL_Running:/{print $2}' "${TEMP}")
+          DELAY=$(awk '/Seconds_Behind_Master:/{print $2}' "${TEMP}")
+          MASTER_HOST=$(awk '/Master_Host:/{print $2}' "${TEMP}")
+          MASTER_USER=$(awk '/Master_User:/{print $2}' "${TEMP}")
+          MASTER_PORT=$(awk '/Master_Port:/{print $2}' "${TEMP}")
+          MASTER_NAME=$(awk '/ Master_Log_File:/{print $2}' "${TEMP}" | awk 'BEGIN { FS = "-bin." } ; {print $1}')
+          LAST_ERROR=$(awk '/Last_Error:/{print $2}' "${TEMP}")
+
+          # Process Replication Status
+          if [[ ${IO_THREAD} = "Yes" ]] && [[ ${SQL_THREAD} = "Yes" ]] && [[ ${DELAY} = "0" ]]; then
+                 REPL_STATUS="Replication is working successfully."
+          elif [[ ${DELAY} -gt 0 ]]; then
+                RECHECK=1
+                REPL_STATUS="Replication is delayed.   \n"
+                REPL_STATUS="${REPL_STATUS}Master Server: ${MASTER_NAME} (${MASTER_HOST})   \n"
+                REPL_STATUS="${REPL_STATUS}Delay: ${DELAY}   \n"
+          elif [[ ${DELAY} = "NULL" ]]; then
+                STOPPED=1
+                REPL_STATUS="Replication is stopped.   \n"
+                REPL_STATUS="${REPL_STATUS}Master Server: ${MASTER_NAME} (${MASTER_HOST})   \n"
+                REPL_STATUS="${REPL_STATUS}Master User: ${MASTER_USER}   \n"
+                REPL_STATUS="${REPL_STATUS}Master Port: ${MASTER_PORT}   \n"
+                REPL_STATUS="${REPL_STATUS}Last Error: ${LAST_ERROR}   \n"
+          else
+                REPL_STATUS="Replication Status could not be read. Is replication running on this server? \n"
+          fi
+   else
+      NOTE="UNK could not retrieve MySQL processlist"
+   fi
+
+   if [[ ${RECHECK} = "1" ]]; then
+      if [[ ${OPT_NAGIOS} != "y" ]]; then
+         REPL_STATUS="${REPL_STATUS}Waiting 10 seconds then checking again...\n"
+      fi
+      sleep 10
+      mysql_exec 'SHOW SLAVE STATUS\G' > "${TEMP}"
+      DELAY2=$(awk '/Seconds_Behind_Master:/{print $2}' "${TEMP}")
+      REPL_STATUS="${REPL_STATUS}Delay: ${DELAY2}   \n"
+      if [ "${DELAY}" -lt "${DELAY2}" ]; then
+         MAX=${DELAY2}
+         # Replication lag increased
+         REPL_STATUS="${REPL_STATUS}Delay is worsening. \n"
+      elif [ "${DELAY}" -eq "${DELAY2}" ]; then
+         MAX=${DELAY}
+         REPL_STATUS="${REPL_STATUS}Delay is neutral. Check again soon. \n"
+      else
+         MAX=${DELAY2}
+         REPL_STATUS="${REPL_STATUS}Delay is recovering. \n"
+      fi
+   fi
+   
+   # Set our post value equal to everything we've learned so far.
+   NOTE=${REPL_STATUS}
+
+   # Remove line breaks for Nagios.
+   if [[ ${OPT_NAGIOS} = "y" ]]; then
+      NOTE=`echo -e ${NOTE} | tr -d '\n'`
+      if [ "${MAX:-0}" -ge "${OPT_CRIT}" ] || [ "${STOPPED}" = "1" ]; then
+         NOTE="CRIT $NOTE"
+      elif [ "${MAX:-0}" -ge "${OPT_WARN}" ]; then
+         NOTE="WARN $NOTE"
+      else
+         NOTE="OK $NOTE"
+      fi
+   fi
+
+   echo -e $NOTE
+}
+
+
+# ########################################################################
+# Execute a MySQL command.
+# This block of code was taken from the Percona Monitoring Plugins
+# copyright 2012 Baron Schwartz, 2012 Percona Inc.
+# ########################################################################
+mysql_exec() {
+   mysql ${OPT_DEFT:+--defaults-file="${OPT_DEFT}"} ${OPT_HOST:+-h"${OPT_HOST}"} ${OPT_USER:+-u"${OPT_USER}"} \
+      ${OPT_PASS:+-p"${OPT_PASS}"} ${OPT_SOCK:+-S"${OPT_SOCK}"} ${OPT_PORT:+-P"${OPT_PORT}"} \
+      -ss -e "$1"
+}
+
+# ########################################################################
+# Determine whether this program is being executed directly, or sourced/included
+# from another file.
+# This block of code was taken from the Percona Monitoring Plugins
+# copyright 2012 Baron Schwartz, 2012 Percona Inc.
+# ########################################################################
+is_not_sourced() {
+   [ "${0##*/}" = "replication_status" ] || [ "${0##*/}" = "bash" -a "$_" = "$0" ]
+}
+
+# ########################################################################
+# Execute the program if it was not included from another file.
+# This makes it possible to include without executing, and thus test.
+# This block of code was taken from the Percona Monitoring Plugins
+# copyright 2012 Baron Schwartz, 2012 Percona Inc.
+# ########################################################################
+if is_not_sourced; then
+   OUTPUT=$(main "$@")
+   EXITSTATUS=$STATE_UNKNOWN
+   case "${OUTPUT}" in
+      UNK*)  EXITSTATUS=$STATE_UNKNOWN;  ;;
+      OK*)   EXITSTATUS=$STATE_OK;       ;;
+      WARN*) EXITSTATUS=$STATE_WARNING;  ;;
+      CRIT*) EXITSTATUS=$STATE_CRITICAL; ;;
+   esac
+   echo "${OUTPUT}"
+   exit $EXITSTATUS
+fi
+
+# ############################################################################
+# Documentation
+# ############################################################################
+: <<'DOCUMENTATION'
+=pod
+
+=head1 NAME
+
+replication_status - Show MySQL Replication Status
+
+=head1 SYNOPSIS
+
+  Usage: replication_status [OPTIONS]
+  Options:
+    -n NAGIOS       Indiciates if nagios alert or not; This option allows the use of -c and -w.
+    -c CRIT         Critical threshold; --Default 1000
+    --defaults-file FILE Only read mysql options from the given file.
+    -H HOST         MySQL hostname.
+    -u USER         MySQL username.
+    -p PASS         MySQL password.
+    -P PORT         MySQL port.
+    -S SOCKET       MySQL socket file.
+    -w WARN         Warning threshold; --Default 1000
+    --help          Print help and exit.
+    --version       Print version and exit.
+  Options must be given as --option value, not --option=value or -Ovalue.
+  Use perldoc to read embedded documentation with more details.
+
+=head1 DESCRIPTION
+
+This script/nagios plugin checks MySQL Replication and lets you know the currently running status.
+
+If called without the -n option, this script will automatically assume it is being run manually.
+The -n option should always be used when running this script for the purpose of a nagios alert.
+The -n option also allows the use of the -w and -c options to override the default warn/crit
+value of 1000 seconds.
+
+The plugin accepts the -w and -c options for compatibility with standard Nagios
+plugin conventions, which both default to 1000.
+Setting the -w and -c flags will only have an affect when the replication is delayed. Stopped replication is always critical.
+
+This plugin assumes mysql can be run directly as "mysql" or user credentials are provided to it
+using the -u, -p, -P, and -H options.
+
+=head1 PRIVILEGES
+
+This plugin executes the following commands against MySQL:
+
+=over
+
+=item *
+
+SHOW SLAVE STATUS\G
+
+=back
+
+This plugin executes the following UNIX commands that may need special privileges:
+
+=over
+
+=item *
+
+mysql
+
+=item *
+
+grep
+
+= item *
+
+tr
+
+= item *
+
+awk
+
+= item * 
+
+echo
+
+=back
+
+=head1 COPYRIGHT, LICENSE, AND WARRANTY
+
+The contents of this file are subject to the Mozilla Public License
+Version 2.0 (the "License"); you may not use this file except in
+compliance with the License. You may obtain a copy of the License at
+http://www.mozilla.org/MPL/
+
+Covered Software is provided under this License on an “as is”
+basis, without warranty of any kind, either expressed, implied,
+or statutory, including, without limitation, warranties that the
+Covered Software is free of defects, merchantable, fit for a
+particular purpose or non-infringing. The entire risk as to the
+quality and performance of the Covered Software is with You.
+Should any Covered Software prove defective in any respect,
+You (not any Contributor) assume the cost of any necessary servicing,
+repair, or correction. This disclaimer of warranty constitutes an
+essential part of this License. No use of any Covered Software is
+authorized under this License except under this disclaimer.
+
+The Original Code is mozsql
+
+The Initial Developer of the Original Code is Brandon Johnson. Portions created
+by Brandon Johnson are Copyright (C) Mozilla, Inc. All Rights Reserved.
+
+Alternatively, the contents of this file may be used under the terms of the
+GNU Public License, Version 2 (the "GPLv2 License"), in which case the
+provisions of GPLv2 License are applicable instead of those above. If you
+wish to allow use of your version of this file only under the terms of the
+GPLv2 License and not to allow others to use your version of this file under
+the MPL, indicate your decision by deleting the provisions above and replace
+them with the notice and other provisions required by the GPLv2 License. If
+you do not delete the provisions above, a recipient may use your version of
+this file under either the MPL or the GPLv2 License.
+
+=head1 VERSION
+
+mozsql replication_status - Replication Status Check 1.0
+
+=cut
+
+DOCUMENTATION
+
