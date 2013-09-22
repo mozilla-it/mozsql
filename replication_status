@@ -107,7 +107,7 @@ main() {
    fi
    
    # Set our post value equal to everything we've learned so far.
-   NOTE=${REPL_STATUS}
+   NOTE=${NOTE:=${REPL_STATUS}}
 
    # Remove line breaks for Nagios.
    if [[ ${OPT_NAGIOS} = "y" ]]; then
